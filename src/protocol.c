@@ -32,26 +32,32 @@ int16_t mems_read_serial(mems_info* info, uint8_t* buffer, uint16_t quantity)
   int16_t totalBytesRead = 0;
   int16_t bytesRead = -1;
   uint8_t *buffer_pt = buffer;
-  int x = 0;
 
   if (mems_is_connected(info))
   {
     do
     {
-#if defined(WIN32)
-      DWORD w32BytesRead = 0;
-      if ((ReadFile(info->sd, (UCHAR *) buffer_pt, quantity, &w32BytesRead, NULL) == TRUE) &&
-          (w32BytesRead > 0))
+      DWORD ftBytesRead = 0;
+      if ((FT_Read(info->ft, buffer_pt, quantity, &ftBytesRead) == FT_OK) &&
+          (ftBytesRead > 0))
       {
-        bytesRead = w32BytesRead;
+        bytesRead = ftBytesRead;
       }
-#else
-      bytesRead = read(info->sd, buffer_pt, quantity);
-#endif
+
       totalBytesRead += bytesRead;
       buffer_pt += bytesRead;
 
     } while ((bytesRead > 0) && (totalBytesRead < quantity));
+  }
+
+  if (totalBytesRead > 0)
+  {
+    dprintf_err("mems_read_serial(): read %d bytes, expected %d:", totalBytesRead, quantity);
+    for (uint8_t i = 0U; i < totalBytesRead; ++i)
+    {
+      dprintf_err(" %02X", buffer[i]);
+    }
+    dprintf_err("\n");
   }
 
   if (totalBytesRead < quantity)
@@ -71,23 +77,60 @@ int16_t mems_read_serial(mems_info* info, uint8_t* buffer, uint16_t quantity)
 int16_t mems_write_serial(mems_info* info, uint8_t* buffer, uint16_t quantity)
 {
   int16_t bytesWritten = -1;
-  int x = 0;
+
+  {
+    dprintf_err("mems_write_serial(): writing %d bytes:", quantity);
+    for (uint32_t i = 0U; i < quantity; ++i)
+    {
+      dprintf_err(" %02X", buffer[i]);
+    }
+    dprintf_err("\n");
+  }
 
   if (mems_is_connected(info))
   {
-#if defined(WIN32)
-    DWORD w32BytesWritten = 0;
-    if ((WriteFile(info->sd, (UCHAR *) buffer, quantity, &w32BytesWritten, NULL) == TRUE) &&
-        (w32BytesWritten == quantity))
+    DWORD ftBytesWritten = 0;
+    if ((FT_Write(info->ft, buffer, quantity, &ftBytesWritten) == FT_OK) &&
+        (ftBytesWritten == quantity))
     {
-      bytesWritten = w32BytesWritten;
+      bytesWritten = ftBytesWritten;
     }
-#else
-    bytesWritten = write(info->sd, buffer, quantity);
-#endif
   }
 
   return bytesWritten;
+}
+
+/**
+ * Sets a break on the serial TX line (takes it low) for a period of
+ * microseconds before disabling again and waiting for the same period.
+ */
+void mems_break_serial(mems_info* info, uint32_t duration_us)
+{
+  uint8_t response = 0xFF;
+
+  if (FT_SetBreakOn(info->ft) == FT_OK)
+  {
+    wait_for_us(duration_us);
+
+    if (FT_SetBreakOff(info->ft) == FT_OK)
+    {
+      wait_for_us(duration_us);
+    }
+    else
+    {
+      dprintf_err("mems_break_serial(): Failed to turn break off\n");
+    }
+  }
+  else
+  {
+    dprintf_err("mems_break_serial(): Failed to turn break on\n");
+  }
+
+  // The break looks like an 0x00 byte so need to read one back
+  if (mems_read_serial(info, &response, 1) != 1)
+  {
+    dprintf_err("mems_break_serial(): Failed to read 0x00\n");
+  }
 }
 
 /**
@@ -128,48 +171,251 @@ bool mems_send_command(mems_info *info, uint8_t cmd)
 }
 
 /**
+ * Sends a multi-byte command to the ECU along with a checksum.
+ */
+bool mems_send_command_with_checksum(mems_info* info, uint8_t* cmd_bytes, uint8_t num_bytes)
+{
+  bool result = true;
+  uint8_t checksum = 0U;
+  uint8_t byte_idx = 0U;
+  static const uint32_t byte_delay_us = 4200U;
+
+  // Commands should be spaced at least 50ms apart
+  static const uint32_t command_delay_us = 50000U;
+  wait_until_us(info->last_command_us + command_delay_us);
+
+  dprintf_err("mems_send_command_with_checksum(): sending command...\n");
+
+  // Send the command
+  uint32_t last_us = get_current_us();
+  while (byte_idx < num_bytes && result)
+  {
+    if (mems_write_serial(info, &cmd_bytes[byte_idx], 1) == 1)
+    {
+      checksum += cmd_bytes[byte_idx];
+      last_us = wait_until_us(last_us + byte_delay_us);
+    }
+    else
+    {
+      dprintf_err("mems_send_command_with_checksum(): failed to send byte %d (%02X) of command\n", byte_idx, cmd_bytes[byte_idx]);
+      result = false;
+    }
+
+    ++byte_idx;
+  }
+
+  dprintf_err("mems_send_command_with_checksum(): sending checksum...\n");
+
+  // Send the command checksum
+  if (mems_write_serial(info, &checksum, 1) != 1)
+  {
+    dprintf_err("mems_send_command_with_checksum(): failed to send checksum byte %02X\n", checksum);
+    result = false;
+  }
+
+  dprintf_err("mems_send_command_with_checksum(): reading back echoed bytes...\n");
+
+  // Read back the echoed bytes
+  uint8_t echoed_byte = 0x00;
+  byte_idx = 0U;
+  while (byte_idx < num_bytes && result)
+  {
+    if (mems_read_serial(info, &echoed_byte, 1) == 1)
+    {
+      if (echoed_byte != cmd_bytes[byte_idx])
+      {
+        dprintf_err("mems_send_command_with_checksum(): echoed byte (%02X) did not match byte %d (%02X)\n", echoed_byte, byte_idx, cmd_bytes[byte_idx]);
+        result = false;
+      }
+    }
+    else
+    {
+      dprintf_err("mems_send_command_with_checksum(): did not receive echo of byte %d (%02X)\n", byte_idx, cmd_bytes[byte_idx]);
+      result = false;
+    }
+
+    ++byte_idx;
+  }
+
+  dprintf_err("mems_send_command_with_checksum(): reading back echoed checksum...\n");
+
+  // Read back the checksum
+  if (mems_read_serial(info, &echoed_byte, 1) == 1)
+  {
+    if (echoed_byte != checksum)
+    {
+      dprintf_err("mems_send_command_with_checksum(): echoed checksum (%02X) did not match sent checksum (%02X)\n", echoed_byte, checksum);
+      result = false;
+    }
+  }
+  else
+  {
+    dprintf_err("mems_send_command_with_checksum(): did not receive echo of checksum (%02X)\n", checksum);
+    result = false;
+  }
+
+  return result;
+}
+
+/**
+ * Receives a multi-byte response with a checksum from the ECU.
+ */
+bool mems_read_response_with_checksum(mems_info* info, uint8_t* response, uint8_t num_bytes)
+{
+  bool result = false;
+  uint8_t checksum = 0;
+  uint8_t byte_idx = 0;
+
+  dprintf_err("mems_read_response_with_checksum(): reading length byte...\n");
+
+  // Read the first byte which is the response length
+  uint8_t length_byte = 0x00;
+  if (mems_read_serial(info, &length_byte, 1) == 1)
+  {
+    if (length_byte == num_bytes)
+    {
+      dprintf_err("mems_read_response_with_checksum(): reading response bytes...\n");
+
+      // Read the response
+      if (mems_read_serial(info, response, num_bytes) == num_bytes)
+      {
+        dprintf_err("mems_read_response_with_checksum(): reading checksum byte...\n");
+
+        // Read the checksum
+        uint8_t checksum_byte = 0x00;
+        if (mems_read_serial(info, &checksum_byte, 1) == 1)
+        {
+          // Calculate and validate the checksum
+          uint8_t calculated_checksum = length_byte;
+          for (byte_idx = 0; byte_idx < num_bytes; ++byte_idx)
+          {
+            calculated_checksum += response[byte_idx];
+          }
+          if (checksum_byte == calculated_checksum)
+          {
+            // The correct number of response bytes were returned and
+            // the checksum was valid!
+            result = true;
+          }
+          else
+          {
+            dprintf_err("mems_read_response_with_checksum(): invalid checksum %02X, expected %02X\n", checksum_byte, calculated_checksum);
+          }
+        }
+        else
+        {
+          dprintf_err("mems_read_response_with_checksum(): failed to read checkum byte\n");
+        }
+      }
+      else
+      {
+        dprintf_err("mems_read_response_with_checksum(): read incorrect number of bytes\n");
+      }
+    }
+    else
+    {
+      dprintf_err("mems_read_response_with_checksum(): read incorrect length response: %02X", length_byte);
+      // Make sure the response is still consumed (including checksum)
+      uint8_t consumed_byte = 0x00;
+      length_byte++;
+      while (length_byte)
+      {
+        if (mems_read_serial(info, &consumed_byte, 1) == 1)
+        {
+          dprintf_err(" %02X", consumed_byte);
+        }
+        else
+        {
+          dprintf_err(" ??");
+        }
+      }
+    }
+  }
+  else
+  {
+    dprintf_err("mems_read_response_with_checksum(): failed to read response length byte\n");
+  }
+
+  // Commands should be spaced apart from the last response byte received
+  info->last_command_us = get_current_us();
+
+  return result;
+}
+
+/**
  * Sends an initialization/startup sequence to the ECU. Required to enable further communication.
  */
-bool mems_init_link(mems_info* info, uint8_t* d0_response_buffer)
+bool mems_init_link(mems_info* info, uint8_t* response_buffer)
 {
-  uint8_t command_a = 0xCA;
-  uint8_t command_b = 0x75;
-  uint8_t command_c = MEMS_Heartbeat;
-  uint8_t command_d = 0xD0;
-  uint8_t buffer = 0x00;
+  switch (info->ver)
+  {
+    default:
+    MEMS_Version_16:
+    {
+      uint8_t command_a = 0xCA;
+      uint8_t command_b = 0x75;
+      uint8_t command_c = MEMS_Heartbeat;
+      uint8_t command_d = 0xD0;
+      uint8_t buffer = 0x00;
 
-  if (!mems_send_command(info, command_a))
-  {
-    dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_a);
-    return false;
-  }
-  if (!mems_send_command(info, command_b))
-  {
-    dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_b);
-    return false;
-  }
-  if (!mems_send_command(info, command_c))
-  {
-    dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_c);
-    return false;
-  }
-  if (mems_read_serial(info, &buffer, 1) != 1)
-  {
-    dprintf_err("mems_init_link(): Did not see null terminator for %02X command\n", command_c);
-    return false;
-  }
-  if (!mems_send_command(info, command_d))
-  {
-    dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_d);
-    return false;
-  }
+      if (!mems_send_command(info, command_a))
+      {
+        dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_a);
+        return false;
+      }
+      if (!mems_send_command(info, command_b))
+      {
+        dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_b);
+        return false;
+      }
+      if (!mems_send_command(info, command_c))
+      {
+        dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_c);
+        return false;
+      }
+      if (mems_read_serial(info, &buffer, 1) != 1)
+      {
+        dprintf_err("mems_init_link(): Did not see null terminator for %02X command\n", command_c);
+        return false;
+      }
+      if (!mems_send_command(info, command_d))
+      {
+        dprintf_err("mems_init_link(): Did not see %02X command echo\n", command_d);
+        return false;
+      }
 
-  // Expect four more bytes after the echo of the D0 command byte.
-  // Response is 99 00 03 03 for Mini SPi.
-  if (mems_read_serial(info, d0_response_buffer, 4) != 4)
-  {
-    dprintf_err("mems_init_link(): Received fewer bytes than expected after echo of %02X command", command_d);
-    return false;
+      // Expect four more bytes after the echo of the D0 command byte.
+      // Response is 99 00 03 03 for Mini SPi.
+      if (mems_read_serial(info, response_buffer, 4) != 4)
+      {
+        dprintf_err("mems_init_link(): Received fewer bytes than expected after echo of %02X command", command_d);
+        return false;
+      }
+
+      break;
+    }
+
+    case MEMS_Version_2J:
+    {
+      // Take the line low to wake up the ECU
+      const uint32_t break_delay_us = 25000U;
+      mems_break_serial(info, break_delay_us);
+
+      // Send the initialisation command
+      uint8_t command[] = {0x81, 0x13, 0xF7, 0x81};
+      uint8_t response[] = {0xFF, 0xFF, 0xFF};
+      if (!(mems_send_command_with_checksum(info, command, sizeof(command)) &&
+            mems_read_response_with_checksum(info, response, sizeof(response))))
+      {
+        dprintf_err("mems_init_link(): Did not receive expected response for first initialisation command\n");
+        return false;
+      }
+
+      // Wait for an addition 50ms
+      info->last_command_us = wait_until_us(info->last_command_us + 50000);
+
+      break;
+    }
   }
 
   return true;
@@ -412,17 +658,47 @@ bool mems_clear_faults(mems_info* info)
 bool mems_heartbeat(mems_info* info)
 {
   bool status = false;
-  uint8_t response = 0xFF;
 
   if (mems_lock(info))
   {
-    // send the command and check for one additional byte after the
-    // echoed command byte (should be 0x00)
-    if (mems_send_command(info, (uint8_t)MEMS_Heartbeat) &&
-        (mems_read_serial(info, &response, 1) == 1))
+    switch (info->ver)
     {
-      status = true;
+      case MEMS_Version_16:
+      default:
+      {
+        uint8_t response = 0xFF;
+        // send the command and check for one additional byte after the
+        // echoed command byte (should be 0x00)
+        if (mems_send_command(info, (uint8_t)MEMS_Heartbeat) &&
+            (mems_read_serial(info, &response, 1) == 1))
+        {
+          status = true;
+        }
+        break;
+      }
+
+      case MEMS_Version_2J:
+      {
+        uint8_t command[] = {0x02, 0x3E, 0x01};
+        uint8_t response[] = {0xFF};
+        if (mems_send_command_with_checksum(info, command, sizeof(command)) &&
+            mems_read_response_with_checksum(info, response, sizeof(response)))
+        {
+          uint8_t expected_response[] = {0x7E};
+          if (memcmp(response, expected_response, sizeof(expected_response)) == 0)
+          {
+            status = true;
+          }
+          else
+          {
+            dprintf_err("mems_heartbeat(): incorrect reponse %02X, expected %02X\n",
+              response[0], expected_response[0]);
+          }
+        }
+        break;
+      }
     }
+
     mems_unlock(info);
   }
 

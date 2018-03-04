@@ -198,27 +198,41 @@ typedef struct
 } librosco_version;
 
 /**
+ * Enumeration for supported MEMS versions
+ */
+enum mems_version
+{
+    MEMS_Version_16 = 0,
+    MEMS_Version_2J = 1,
+    MEMS_Num_Versions = 2
+};
+
+typedef enum mems_version mems_ver;
+
+/**
  * Contains information about the state of the current connection to the ECU.
  */
 typedef struct
 {
+    //! Version of MEMS
+    mems_ver ver;
+    //! Handle to the FTDI device
+    void* ft;
 #if defined(WIN32)
-    //! Descriptor for the serial port device
-    HANDLE sd;
     //! Lock to prevent multiple simultaneous open/close/read/write operations
     HANDLE mutex;
 #else
-    //! Descriptor for the serial port device
-    int sd;
     //! Lock to prevent multiple simultaneous open/close/read/write operations
     pthread_mutex_t mutex;
 #endif
+    //! Time of last command
+    uint32_t last_command_us;
 } mems_info;
 
-void mems_init(mems_info* info);
-bool mems_init_link(mems_info* info, uint8_t* d0_response_buffer);
+void mems_init(mems_info* info, mems_ver ver);
+bool mems_init_link(mems_info* info, uint8_t* response_buffer);
 void mems_cleanup(mems_info* info);
-bool mems_connect(mems_info* info, const char* devPath);
+bool mems_connect(mems_info* info);
 void mems_disconnect(mems_info* info);
 bool mems_is_connected(mems_info* info);
 bool mems_read_raw(mems_info* info, mems_data_frame_80* frame80, mems_data_frame_7d* frame7d);

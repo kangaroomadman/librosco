@@ -10,6 +10,7 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
 
 #if defined(WIN32)
   #include <windows.h>
@@ -29,15 +30,16 @@
  * to connect to the ECU; that requires mems_connect().
  * @param info 
  */
-void mems_init(mems_info *info)
+void mems_init(mems_info *info, mems_ver ver)
 {
+    info->ver = ver;
+    info->ft = 0;
 #if defined(WIN32)
-    info->sd = INVALID_HANDLE_VALUE;
     info->mutex = CreateMutex(NULL, TRUE, NULL);
 #else
-    info->sd = 0;
     pthread_mutex_init(&info->mutex, NULL);
 #endif
+    info ->last_command_us = 0;
 }
 
 /**
@@ -46,19 +48,14 @@ void mems_init(mems_info *info)
  */
 void mems_cleanup(mems_info *info)
 {
-#if defined(WIN32)
     if (mems_is_connected(info))
     {
-        CloseHandle(info->sd);
-        info->sd = INVALID_HANDLE_VALUE;
+        FT_Close(info->ft);
+        info->ft = 0;
     }
+#if defined(WIN32)
     CloseHandle(info->mutex);
 #else
-    if (mems_is_connected(info))
-    {
-        close(info->sd);
-        info->sd = 0;
-    }
     pthread_mutex_destroy(&info->mutex);
 #endif
 }
@@ -89,8 +86,8 @@ void mems_disconnect(mems_info *info)
     {
         if (mems_is_connected(info))
         {
-            CloseHandle(info->sd);
-            info->sd = INVALID_HANDLE_VALUE;
+            FT_Close(info->ft);
+            info->ft = 0;
         }
 
         ReleaseMutex(info->mutex);
@@ -100,8 +97,8 @@ void mems_disconnect(mems_info *info)
 
     if (mems_is_connected(info))
     {
-        close(info->sd);
-        info->sd = 0;
+        FT_Close(info->ft);
+        info->ft = 0;
     }
 
     pthread_mutex_unlock(&info->mutex);
@@ -109,25 +106,24 @@ void mems_disconnect(mems_info *info)
 }
 
 /**
- * Opens the serial port (or returns with success if it is already open.)
+ * Opens the FTDI device (or returns with success if it is already open.)
  * @param info State information for the current connection.
- * @param devPath Full path to the serial device (e.g. "/dev/ttyUSB0" or "COM2")
  * @return True if the serial device was successfully opened and its
  *   baud rate was set; false otherwise.
  */
-bool mems_connect(mems_info *info, const char *devPath)
+bool mems_connect(mems_info *info)
 {
     bool result = false;
 
 #if defined(WIN32)
     if (WaitForSingleObject(info->mutex, INFINITE) == WAIT_OBJECT_0)
     {
-        result = mems_is_connected(info) || mems_openserial(info, devPath);
+        result = mems_is_connected(info) || mems_openserial(info);
         ReleaseMutex(info->mutex);
     }
 #else // Linux/Unix
     pthread_mutex_lock(&info->mutex);
-    result = mems_is_connected(info) || mems_openserial(info, devPath);
+    result = mems_is_connected(info) || mems_openserial(info);
     pthread_mutex_unlock(&info->mutex);
 #endif
 
@@ -135,127 +131,80 @@ bool mems_connect(mems_info *info, const char *devPath)
 }
 
 /**
- * Opens the serial device for the USB<->TTL/serial converter and sets the
+ * Opens the FTDI device for the USB<->TTL/serial converter and sets the
  * parameters for the link to match those on the MEMS ECU.
- * Uses OS-specific calls to do this in the correct manner.
- * Note for FreeBSD users: Do not use the ttyX devices, as they block
- * on the open() call while waiting for a carrier detect line, which
- * will never be asserted. Instead, use the equivalent cuaX device.
- * Example: /dev/cuaU0 (instead of /dev/ttyU0)
+ *
+ * This assumes there is only a single FTDI device available as it simply
+ * opens the first one available.
+ *
  * @return True if the open/setup was successful, false otherwise
  */
-bool mems_openserial(mems_info *info, const char *devPath)
+bool mems_openserial(mems_info *info)
 {
     bool retVal = false;
+    FT_STATUS status;
 
-#if defined(linux) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
-
-    struct termios newtio;
-    bool success = true;
-
-    info->sd = open(devPath, O_RDWR | O_NOCTTY);
-
-    if (info->sd > 0)
+    status = FT_Open(0, &info->ft);
+    if (status == FT_OK)
     {
-        if (tcgetattr(info->sd, &newtio) != 0)
+        status = FT_SetDataCharacteristics(info->ft, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE);
+        if (status == FT_OK)
         {
-            success = false;
-        }
-
-        if (success)
-        {
-            // set up the serial port:
-            // * enable the receiver, set 8-bit fields, set local mode, disable hardware flow control, disable two stop bits
-            // * set non-canonical mode, disable echos, disable signals
-            // * disable all special handling of CR or LF, disable software flow control
-            // * disable all output post-processing
-            newtio.c_cflag &= ((CREAD | CS8 | CLOCAL) & ~(CRTSCTS & CSTOPB));
-            newtio.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-            newtio.c_iflag &= ~(INLCR | ICRNL | IGNCR | IXON | IXOFF | IXANY);
-            newtio.c_oflag &= ~OPOST;
-
-#if defined(linux) || defined(__APPLE__)
-            // when waiting for responses, wait until we haven't received any
-            // characters for a period of time before returning with failure
-            newtio.c_cc[VTIME] = 1;
-            newtio.c_cc[VMIN] = 0;
-#else // BSD and other UNIXes
-            // This is set higher than the 0.1 seconds used by the Linux/OSX
-            // code, as values much lower than this cause the first echoed
-            // byte to be missed when running under BSD.
-            newtio.c_cc[VTIME] = 5;
-            newtio.c_cc[VMIN] = 0;
-#endif
-            cfsetispeed(&newtio, B9600);
-            cfsetospeed(&newtio, B9600);
-
-            // flush the serial buffers and set the new parameters
-            if ((tcflush(info->sd, TCIFLUSH) != 0) ||
-                (tcsetattr(info->sd, TCSANOW, &newtio) != 0))
+            switch (info->ver)
             {
-                close(info->sd);
-                success = false;
-            }
-        }
-
-        retVal = success;
-
-        // close the device if it couldn't be configured
-        if (retVal == false)
-        {
-            close(info->sd);
-        }
-    }
-
-#elif defined(WIN32)
-
-    DCB dcb;
-    COMMTIMEOUTS commTimeouts;
-
-    // open and get a handle to the serial device
-    info->sd = CreateFile(devPath, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-    // verify that the serial device was opened
-    if (info->sd != INVALID_HANDLE_VALUE)
-    {
-        if (GetCommState(info->sd, &dcb) == TRUE)
-        {
-            // set the serial port parameters
-            dcb.BaudRate = 9600;
-            dcb.fParity = FALSE;
-            dcb.fOutxCtsFlow = FALSE;
-            dcb.fOutxDsrFlow = FALSE;
-            dcb.fDtrControl = FALSE;
-            dcb.fRtsControl = FALSE;
-            dcb.ByteSize = 8;
-            dcb.Parity = 0;
-            dcb.StopBits = ONESTOPBIT;
-
-            if ((SetCommState(info->sd, &dcb) == TRUE) &&
-                (GetCommTimeouts(info->sd, &commTimeouts) == TRUE))
-            {
-                // modify the COM port parameters to wait 100 ms before timing out
-                commTimeouts.ReadIntervalTimeout = 100;
-                commTimeouts.ReadTotalTimeoutMultiplier = 0;
-                commTimeouts.ReadTotalTimeoutConstant = 100;
-
-                if (SetCommTimeouts(info->sd, &commTimeouts) == TRUE)
+                case MEMS_Version_16:
+                default:
                 {
-                    retVal = true;
+                    status = FT_SetBaudRate(info->ft, 9600);
+                    break;
+                }
+
+                case MEMS_Version_2J:
+                {
+                    status = FT_SetBaudRate(info->ft, 10400);
+                    break;
                 }
             }
+
+            if (status == FT_OK)
+            {
+                status = FT_SetTimeouts(info->ft, 100, 100);
+                if (status == FT_OK)
+                {
+                    status = FT_SetFlowControl(info->ft, FT_FLOW_NONE, 0, 0);
+                    if (status == FT_OK)
+                    {
+                        retVal = true;
+                    }
+                    else
+                    {
+                        dprintf_err("mems_openserial(): Failed to configure flow control: status = %d\n", status);
+                    }
+                }
+                else
+                {
+                    dprintf_err("mems_openserial(): Failed to set timeouts: status = %d\n", status);
+                }
+            }
+            else
+            {
+                dprintf_err("mems_openserial(): Failed to set BAUD rate: status = %d\n", status);
+            }
+        }
+        else
+        {
+            dprintf_err("mems_openserial(): Failed to set serial characteristics: status = %d\n", status);
         }
 
-        // the serial device was opened, but couldn't be configured properly;
-        // close it before returning with failure
-        if (!retVal)
+        if (status != FT_OK)
         {
-            CloseHandle(info->sd);
+            FT_Close(info->ft);
         }
     }
-
-#endif
+    else
+    {
+        dprintf_err("mems_openserial(): Failed to open FTDI device: status = %d\n", status);
+    }
 
     return retVal;
 }
@@ -267,10 +216,6 @@ bool mems_openserial(mems_info *info, const char *devPath)
  */
 bool mems_is_connected(mems_info* info)
 {
-#if defined(WIN32)
-    return (info->sd != INVALID_HANDLE_VALUE);
-#else
-    return (info->sd > 0);
-#endif
+    return (info->ft != 0);
 }
 

@@ -36,6 +36,9 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "NetBSD")
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
   set (CMAKE_INSTALL_PREFIX "/usr")
   message (STATUS "Defaulting install path prefix to ${CMAKE_INSTALL_PREFIX}.")
+else()
+  set (CMAKE_INSTALL_PREFIX "$ENV{SystemDrive}/${PROJECT_NAME}")
+  message (STATUS "Defaulting install path prefix to ${CMAKE_INSTALL_PREFIX}.")
 endif()
 
 set(INSTALL_BIN_DIR "bin" CACHE PATH "Installation directory for executables")
@@ -82,16 +85,19 @@ include_directories (
   "${CMAKE_SOURCE_DIR}"
   "${CMAKE_BINARY_DIR}"
   "${CMAKE_SOURCE_DIR}/src"
+  "${CMAKE_SOURCE_DIR}/ftdi"
   )
 
 if (BUILD_STATIC STREQUAL "ON")
   add_library (rosco STATIC ${SOURCE_SUBDIR}/setup.c
-                            ${SOURCE_SUBDIR}/protocol.c)
+                            ${SOURCE_SUBDIR}/protocol.c
+                            ${SOURCE_SUBDIR}/timing.c)
   set (LIBNAME "${PROJECT_NAME}.a")
   set (LIB_DESTINATION_DIR "${INSTALL_LIB_DIR}")
 else()
   add_library (rosco SHARED ${SOURCE_SUBDIR}/setup.c
-                            ${SOURCE_SUBDIR}/protocol.c)
+                            ${SOURCE_SUBDIR}/protocol.c
+                            ${SOURCE_SUBDIR}/timing.c)
   if (MINGW)
     set (LIBNAME "${PROJECT_NAME}.dll")
     set (LIB_DESTINATION_DIR "${INSTALL_BIN_DIR}")
@@ -123,6 +129,7 @@ if (MINGW)
         SOVERSION ${LIBROSCO_VER_MAJOR}
         VERSION ${LIBROSCO_VER_MAJOR}
   )
+  target_link_libraries(rosco ${CMAKE_SOURCE_DIR}/ftdi/ftd2xx.lib)
 
   target_link_libraries (readmems rosco)
 

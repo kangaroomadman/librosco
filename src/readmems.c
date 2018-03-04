@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <libgen.h>
 #include "rosco.h"
+#include "ftd2xx.h"
 
 enum command_idx
 {
@@ -21,7 +22,8 @@ enum command_idx
   MC_Coil = 8,
   MC_Injectors = 9,
   MC_Interactive = 10,
-  MC_Num_Commands = 11
+  MC_Heartbeat = 11,
+  MC_Num_Commands = 12
 };
 
 static const char* commands[] = { "read",
@@ -34,7 +36,14 @@ static const char* commands[] = { "read",
   "ac",
   "coil",
   "injectors",
-  "interactive"
+  "interactive",
+  "heartbeat"
+};
+
+static const char* mems_versions[] =
+{
+  "1.6",
+  "2J"
 };
 
 
@@ -57,40 +66,31 @@ void printbuf(uint8_t* buf, unsigned int count)
 
 int16_t readserial(mems_info* info, uint8_t* buffer, uint16_t quantity)
 {
-  int16_t bytesread = -1;
+  int16_t bytesRead = -1;
 
-#if defined (WIN32)
-  DWORD w32BytesRead = 0;
-
-  if ((ReadFile(info->sd, (UCHAR *) buffer, quantity, &w32BytesRead, NULL) == TRUE) && (w32BytesRead > 0))
+  DWORD ftBytesRead = 0;
+  if ((FT_Read(info->ft, buffer, quantity, &ftBytesRead) == FT_OK) &&
+      (ftBytesRead > 0))
   {
-    bytesread = w32BytesRead;
+    bytesRead = ftBytesRead;
   }
-#else
-  bytesread = read(info->sd, buffer, quantity);
-#endif
 
-  return bytesread;
+  return bytesRead;
 }
 
 
 int16_t writeserial(mems_info* info, uint8_t* buffer, uint16_t quantity)
 {
-  int16_t byteswritten = -1;
+  int16_t bytesWritten = -1;
 
-#if defined(WIN32)
-  DWORD w32BytesWritten = 0;
-
-  if ((WriteFile(info->sd, (UCHAR*) buffer, quantity, &w32BytesWritten, NULL) == TRUE) &&
-      (w32BytesWritten == quantity))
+  DWORD ftBytesWritten = 0;
+  if ((FT_Write(info->ft, buffer, quantity, &ftBytesWritten) == FT_OK) &&
+      (ftBytesWritten == quantity))
   {
-    byteswritten = w32BytesWritten;
+    bytesWritten = ftBytesWritten;
   }
-#else
-  byteswritten = write(info->sd, buffer, quantity);
-#endif
 
-  return byteswritten;
+  return bytesWritten;
 }
 
 
@@ -165,6 +165,7 @@ bool interactive_mode(mems_info* info, uint8_t* response_buffer)
 int main(int argc, char **argv)
 {
   bool success = false;
+  int ver_idx = 0;
   int cmd_idx = 0;
   mems_data data;
   mems_data_frame_80 frame80;
@@ -184,16 +185,19 @@ int main(int argc, char **argv)
   // this is twice as large as the micro's on-chip ROM, so it's probably sufficient
   uint8_t response_buffer[16384];
 
-  char win32devicename[16];
-
   ver = mems_get_lib_version();
 
   if (argc < 3)
   {
     printf("readmems using librosco v%d.%d.%d\n", ver.major, ver.minor, ver.patch);
     printf("Diagnostic utility using ROSCO protocol for MEMS 1.6 systems\n");
-    printf("Usage: %s <serial device> <command> [read-loop-count]\n", basename(argv[0]));
-    printf(" where <command> is one of the following:\n");
+    printf("Usage: %s <mems version> <command> [read-loop-count]\n", basename(argv[0]));
+    printf(" where <mems version> is one of the following:\n");
+    for (ver_idx = 0; ver_idx < MEMS_Num_Versions; ++ver_idx)
+    {
+      printf("\t%s\n", mems_versions[ver_idx]);
+    }
+    printf(" and <command> is one of the following:\n");
     for (cmd_idx = 0; cmd_idx < MC_Num_Commands; ++cmd_idx)
     {
       printf("\t%s\n", commands[cmd_idx]);
@@ -201,6 +205,17 @@ int main(int argc, char **argv)
     printf(" and [read-loop-count] is either a number or 'inf' to read forever.\n");
 
     return 0;
+  }
+
+  while ((ver_idx < MEMS_Num_Versions) && (strcasecmp(argv[1], mems_versions[ver_idx]) != 0))
+  {
+    ver_idx += 1;
+  }
+
+  if (ver_idx >= MEMS_Num_Versions)
+  {
+    printf("Invalid MEMS version: %s\n", argv[1]);
+    return -1;
   }
 
   while ((cmd_idx < MC_Num_Commands) && (strcasecmp(argv[2], commands[cmd_idx]) != 0))
@@ -226,25 +241,20 @@ int main(int argc, char **argv)
     }
   }
 
+  printf("Using MEMS %s\n", mems_versions[ver_idx]);
+
   if (cmd_idx != MC_Interactive)
   {
     printf("Running command: %s\n", commands[cmd_idx]);
   }
 
-  mems_init(&info);
+  mems_init(&info, ver_idx);
 
-#if defined(WIN32)
-  // correct for microsoft's legacy nonsense by prefixing with "\\.\"
-  strcpy(win32devicename, "\\\\.\\");
-  strncat(win32devicename, argv[1], 16);
-  if (mems_connect(&info, win32devicename))
-#else
-  if (mems_connect(&info, argv[1]))
-#endif
+  if (mems_connect(&info))
   {
     if (mems_init_link(&info, response_buffer))
     {
-      printf("ECU responded to D0 command with: %02X %02X %02X %02X\n\n",
+      printf("ECU responded to initialization with: %02X %02X %02X %02X\n\n",
              response_buffer[0], response_buffer[1], response_buffer[2], response_buffer[3]);
 
       switch (cmd_idx)
@@ -362,6 +372,13 @@ int main(int argc, char **argv)
         success = interactive_mode(&info, response_buffer);
         break;
 
+      case MC_Heartbeat:
+        do
+        {
+          success = mems_heartbeat(&info);
+        } while (success);
+        break;
+
       default:
         printf("Error: invalid command\n");
         break;
@@ -375,11 +392,7 @@ int main(int argc, char **argv)
   }
   else
   {
-#if defined(WIN32)
-    printf("Error: could not open serial device (%s).\n", win32devicename);
-#else
-    printf("Error: could not open serial device (%s).\n", argv[1]);
-#endif
+    printf("Error: could not open FTDI device.\n");
   }
 
   mems_cleanup(&info);
